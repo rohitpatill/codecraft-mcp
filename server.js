@@ -1,14 +1,8 @@
 #!/usr/bin/env node
 
 /**
- * CodeCraft MCP Server - V2.1
- *
- * Enhanced version with a professional git workflow and essential file system operations.
- * * Key improvements:
- * - Streamlined toolset by removing redundant/unnecessary tools.
- * - Added `delete_file` and `move_or_rename_file` for complete file lifecycle management.
- * - Massively enhanced `git_tool` with pull, push, and checkout capabilities, plus a detailed description
- * of a professional development workflow to guide the agent.
+ * CodeCraft MCP Server - V2.0
+ * Production-ready MCP server for autonomous software development
  */
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
@@ -19,39 +13,56 @@ import path from 'path';
 import { exec } from 'child_process';
 import { fileURLToPath } from 'url';
 import simpleGit from 'simple-git';
-import { diff_match_patch } from 'diff-match-patch';
-import TreeSitter from 'tree-sitter';
-import JavaScript from 'tree-sitter-javascript';
 import { Octokit } from '@octokit/rest';
+import { glob } from 'glob';
+import dotenv from 'dotenv';
 
-// --- SECURITY: Read the sandbox directory reliably ---
+// Load environment variables
+dotenv.config();
+
+// Setup directory paths
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const packageJsonPath = path.join(__dirname, 'package.json');
-const packageJson = JSON.parse(await fs.readFile(packageJsonPath, 'utf-8'));
-const SANDBOX_DIR = path.resolve(packageJson.projectDirectory);
-// Declare the fallback GitHub token. It will use the .env variable first.
-const GITHUB_TOKEN_FALLBACK = process.env.GITHUB_TOKEN || "";
+const SANDBOX_DIR = path.resolve(process.env.PROJECT_DIR || process.cwd());
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN || '';
+const SHELL_MODE = process.env.SHELL_MODE || 'restricted';
+
+// Restricted commands whitelist for security
+const ALLOWED_COMMANDS = [
+    'npm', 'yarn', 'pnpm', 'node', 'python', 'pip', 'java', 'javac', 'mvn', 'gradle',
+    'go', 'cargo', 'rustc', 'gcc', 'g++', 'make', 'cmake', 'git', 'docker',
+    'ls', 'dir', 'pwd', 'cat', 'type', 'echo', 'test', 'jest', 'mocha', 'pytest',
+    'eslint', 'prettier', 'tsc', 'webpack', 'vite', 'rollup', 'parcel'
+];
 
 class CodeCraftMCPServer {
     constructor() {
         this.server = new Server(
-            { name: 'codecraft-mcp', version: '1.0.0' },
+            { name: 'codecraft-mcp', version: '2.0.0' },
             { capabilities: { tools: {} } }
         );
         this.git = simpleGit({ baseDir: SANDBOX_DIR });
-        this.dmp = new diff_match_patch();
-        this.parser = new TreeSitter();
-        this.parser.setLanguage(JavaScript);
         this.setupHandlers();
     }
 
     _resolveSandboxPath(userPath) {
         const resolvedPath = path.resolve(SANDBOX_DIR, userPath);
         if (!resolvedPath.startsWith(SANDBOX_DIR)) {
-            throw new Error(`Security Violation: Path traversal attempt blocked for path: ${userPath}`);
+            throw new Error(`Security: Path traversal blocked - ${userPath}`);
         }
         return resolvedPath;
+    }
+
+    _validateShellCommand(command) {
+        if (SHELL_MODE === 'unsafe') return true;
+
+        const baseCommand = command.trim().split(/\s+/)[0];
+        const commandName = path.basename(baseCommand);
+
+        if (!ALLOWED_COMMANDS.includes(commandName)) {
+            throw new Error(`Command '${commandName}' not allowed. Set SHELL_MODE=unsafe to enable.`);
+        }
+        return true;
     }
 
     setupHandlers() {
@@ -59,67 +70,35 @@ class CodeCraftMCPServer {
             tools: [
                 {
                     name: 'create_or_overwrite_file',
-                    description: `
-                        **Purpose:** Creates a new file from scratch or completely replaces an existing file with new content.
-                        **When to use:** - Creating new files.
-                        - Making extensive changes to small files (< 100 lines).
-                        - When other editing tools fail repeatedly.
-                        **When NOT to use:** - For small edits in large files (use smart_replace instead).
-                        **Example:** To create a simple Python web server file.
-                        {
-                            "file_path": "server.py",
-                            "content": "import http.server\\nimport socketserver\\n\\nPORT = 8000\\nHandler = http.server.SimpleHTTPRequestHandler\\n\\nwith socketserver.TCPServer((\\"\\", PORT), Handler) as httpd:\\n    print(\\"serving at port\\", PORT)\\n    httpd.serve_forever()"
-                        }
-                    `,
+                    description: `Creates new file or replaces existing file.
+**When to use:** Creating new files, rewriting small files (<100 lines)
+**Example:** {"file_path": "app.js", "content": "console.log('hello')"}`,
                     inputSchema: {
                         type: 'object',
                         properties: {
-                            file_path: { type: 'string', description: 'The relative path for the file to be created or overwritten.' },
-                            content: { type: 'string', description: 'The full content to write to the file.' }
+                            file_path: { type: 'string', description: 'Relative file path' },
+                            content: { type: 'string', description: 'Full file content' }
                         },
                         required: ['file_path', 'content']
                     }
                 },
                 {
                     name: 'smart_replace',
-                    description: `
-                        **Purpose:** The MOST RELIABLE way to edit code. Intelligently replaces code by understanding context.
-                        **When to use:** ALWAYS try this first for any code changes!
-                        **Why it's better:** Handles whitespace, finds similar matches, and works with partial content.
-                        
-                        **Strategy 1 - Minimal Context (RECOMMENDED):**
-                        Include just enough context to uniquely identify the location:
-                        {
-                            "file_path": "main.py",
-                            "old_code": "x = 10",
-                            "new_code": "x = 20"
-                        }
-                        
-                        **Strategy 2 - Function/Block Level:**
-                        {
-                            "file_path": "utils.py",
-                            "old_code": "def calculate(x):\\n    return x * 2",
-                            "new_code": "def calculate(x):\\n    return x * 3"
-                        }
-                        
-                        **THIS TOOL IS SMART:** - Ignores minor whitespace differences.
-                        - Handles indentation intelligently.
-                        - Can match partial lines if unique.
-                        - Works with any programming language.
-                        
-                        **Success Rate: 99%** when used correctly!
-                    `,
+                    description: `Intelligently replaces code with fuzzy matching.
+**Strategy 1:** Minimal context for unique strings
+**Strategy 2:** Include function/class for safer matches
+**Auto-handles:** whitespace, indentation differences`,
                     inputSchema: {
                         type: 'object',
                         properties: {
-                            file_path: { type: 'string', description: 'The relative path to the file.' },
-                            old_code: { type: 'string', description: 'Code to find (can be partial, will be matched intelligently).' },
-                            new_code: { type: 'string', description: 'Code to replace with.' },
+                            file_path: { type: 'string', description: 'File to edit' },
+                            old_code: { type: 'string', description: 'Code to find (can be partial)' },
+                            new_code: { type: 'string', description: 'Replacement code' },
                             match_mode: {
                                 type: 'string',
                                 enum: ['exact', 'fuzzy', 'smart'],
                                 default: 'smart',
-                                description: 'exact: requires perfect match, fuzzy: allows whitespace differences, smart: intelligent matching (recommended)'
+                                description: 'Match strategy'
                             }
                         },
                         required: ['file_path', 'old_code', 'new_code']
@@ -127,287 +106,331 @@ class CodeCraftMCPServer {
                 },
                 {
                     name: 'search_in_file',
-                    description: `
-                        **Purpose:** Search for text/patterns in a file and get all occurrences with line numbers.
-                        **When to use:** - Before making edits, to find exact locations.
-                        - To verify if a change needs to be made.
-                        - To find all instances of a variable/function.
-                        **Returns:** Array of matches with line numbers and content.
-                        **Example:** Find all occurrences of a function name.
-                        {
-                            "file_path": "main.js",
-                            "search_text": "handleClick",
-                            "case_sensitive": false
-                        }
-                    `,
+                    description: `Search for text/patterns in file with line numbers.
+**Returns:** All matches with line numbers and optional context`,
                     inputSchema: {
                         type: 'object',
                         properties: {
-                            file_path: { type: 'string', description: 'The relative path to the file.' },
-                            search_text: { type: 'string', description: 'Text or pattern to search for.' },
-                            case_sensitive: { type: 'boolean', default: true, description: 'Whether search should be case sensitive.' }
+                            file_path: { type: 'string' },
+                            search_text: { type: 'string', description: 'Text or regex pattern' },
+                            case_sensitive: { type: 'boolean', default: true },
+                            use_regex: { type: 'boolean', default: false },
+                            context_lines: { type: 'integer', default: 0, description: 'Lines around match' }
                         },
                         required: ['file_path', 'search_text']
                     }
                 },
                 {
                     name: 'get_code_context',
-                    description: `
-                        **Purpose:** Retrieves a specific snippet of code from a file, including exact line numbers.
-                        **When to use:** - Before using smart_replace to see the exact content.
-                        - To understand code structure around a specific line.
-                        - To verify changes were applied correctly.
-                        **Returns:** Lines with numbers in format "LINE_NUM: CONTENT"
-                        **Example:** To get the context around a function you want to modify on line 50.
-                        {
-                            "file_path": "main.js",
-                            "line_number": 50,
-                            "context_lines": 5
-                        }
-                        **Note:** Line numbers are 1-based (first line is line 1, not 0).
-                    `,
+                    description: `Get code snippet around specific line.
+**Returns:** Numbered lines with context`,
                     inputSchema: {
                         type: 'object',
                         properties: {
-                            file_path: { type: 'string', description: 'The relative path to the file.' },
-                            line_number: { type: 'integer', description: 'The central line number to get context around (1-based).' },
-                            context_lines: { type: 'integer', default: 5, description: 'The number of lines to fetch before and after the central line.' }
+                            file_path: { type: 'string' },
+                            line_number: { type: 'integer', description: '1-based line number' },
+                            context_lines: { type: 'integer', default: 5 }
                         },
                         required: ['file_path', 'line_number']
                     }
                 },
                 {
                     name: 'delete_lines',
-                    description: `
-                        **Purpose:** Delete a range of lines from a file.
-                        **When to use:** - Removing deprecated functions.
-                        - Deleting unused imports.
-                        - Cleaning up commented code.
-                        **Example:** Delete lines 10-15 (inclusive).
-                        {
-                            "file_path": "old_code.js",
-                            "start_line": 10,
-                            "end_line": 15
-                        }
-                        **Note:** Line numbers are inclusive and 1-based.
-                    `,
+                    description: `Delete line range from file.`,
                     inputSchema: {
                         type: 'object',
                         properties: {
-                            file_path: { type: 'string', description: 'The relative path to the file.' },
-                            start_line: { type: 'integer', description: 'First line to delete (1-based, inclusive).' },
-                            end_line: { type: 'integer', description: 'Last line to delete (1-based, inclusive).' }
+                            file_path: { type: 'string' },
+                            start_line: { type: 'integer', description: 'First line (1-based)' },
+                            end_line: { type: 'integer', description: 'Last line (inclusive)' }
                         },
                         required: ['file_path', 'start_line', 'end_line']
                     }
                 },
                 {
-                    name: 'execute_shell_command',
-                    description: `
-                        **Purpose:** Executes any shell command inside the project directory.
-                        **When to use:** - Running tests after changes.
-                        - Installing dependencies.
-                        - Building the project.
-                        - Running linters or formatters.
-                        **Example 1:** Install dependencies.
-                        {
-                            "command": "npm install express"
-                        }
-                        **Example 2:** Run tests.
-                        {
-                            "command": "python -m pytest tests/",
-                            "timeout_seconds": 300
-                        }
-                        **Note:** Commands run in the project directory with a default 120-second timeout.
-                    `,
+                    name: 'insert_lines',
+                    description: `Insert content at specific position.
+**Position strategies:**
+- Line number: {"line_number": 10, "insert_mode": "after"}
+- Pattern: {"after_pattern": "function setup()"}
+- Relative: {"relative_to": {"pattern": "class", "offset": 2}}`,
                     inputSchema: {
                         type: 'object',
                         properties: {
-                            command: { type: 'string', description: 'The command to execute.' },
-                            timeout_seconds: { type: 'integer', default: 120, description: 'Maximum execution time in seconds.' }
+                            file_path: { type: 'string' },
+                            content: { type: 'string' },
+                            position: {
+                                type: 'object',
+                                properties: {
+                                    line_number: { type: 'integer' },
+                                    insert_mode: { type: 'string', enum: ['before', 'after'], default: 'after' },
+                                    after_pattern: { type: 'string' },
+                                    before_pattern: { type: 'string' },
+                                    relative_to: {
+                                        type: 'object',
+                                        properties: {
+                                            pattern: { type: 'string' },
+                                            offset: { type: 'integer' }
+                                        }
+                                    }
+                                }
+                            },
+                            match_occurrence: { type: 'integer', default: 1 },
+                            create_if_missing: { type: 'boolean', default: false },
+                            preserve_indentation: { type: 'boolean', default: true }
+                        },
+                        required: ['file_path', 'content', 'position']
+                    }
+                },
+                {
+                    name: 'execute_shell_command',
+                    description: `Execute shell commands. 
+**Restricted mode:** Only safe commands allowed (npm, python, git, etc)
+**Set SHELL_MODE=unsafe in .env for unrestricted access**`,
+                    inputSchema: {
+                        type: 'object',
+                        properties: {
+                            command: { type: 'string' },
+                            working_dir: { type: 'string', default: '.', description: 'Relative to project root' },
+                            timeout_seconds: { type: 'integer', default: 120 }
                         },
                         required: ['command']
                     }
                 },
                 {
                     name: 'read_file_content',
-                    description: `
-                        **Purpose:** Reads the entire content of a specified file.
-                        **When to use:** - Initial understanding of file structure.
-                        - Reading configuration files.
-                        - Checking file content after modifications.
-                        **When NOT to use:** - For large files (use get_code_context instead).
-                        **Example:** To read a project's README file.
-                        {
-                            "file_path": "README.md"
-                        }
-                    `,
+                    description: `Read entire file content.`,
                     inputSchema: {
                         type: 'object',
                         properties: {
-                            file_path: { type: 'string', description: 'The relative path to the file.' }
+                            file_path: { type: 'string' }
                         },
                         required: ['file_path']
                     }
                 },
                 {
                     name: 'list_directory',
-                    description: `
-                        **Purpose:** Lists the files and subdirectories within a directory.
-                        **When to use:** - Initial project exploration.
-                        - Finding files to modify.
-                        - Understanding project structure.
-                        **Example:** To see what's in the src directory.
-                        {
-                            "dir_path": "src"
-                        }
-                        **Note:** Use "." for current directory.
-                    `,
+                    description: `List directory with filtering.
+**Examples:** {"filter": "*.js"}, {"max_depth": 3}`,
                     inputSchema: {
                         type: 'object',
                         properties: {
-                            dir_path: { type: 'string', default: '.', description: 'The relative path to the directory.' }
-                        },
-                        required: []
+                            dir_path: { type: 'string', default: '.' },
+                            filter: { type: 'string', description: 'Glob pattern' },
+                            include_hidden: { type: 'boolean', default: false },
+                            max_depth: { type: 'integer', default: 1, minimum: 1, maximum: 5 },
+                            max_files: { type: 'integer', default: 100 }
+                        }
                     }
                 },
                 {
                     name: 'delete_file',
-                    description: `
-                        **Purpose:** Deletes a file from the file system.
-                        **When to use:**
-                        - Removing temporary files.
-                        - Deleting old or unused code files after a refactor.
-                        - Cleaning up the project directory.
-                        **Example:** To delete a temporary data file.
-                        {
-                            "file_path": "temp/data.tmp"
-                        }
-                    `,
+                    description: `Delete file permanently.`,
                     inputSchema: {
                         type: 'object',
                         properties: {
-                            file_path: { type: 'string', description: 'The relative path of the file to delete.' }
+                            file_path: { type: 'string' }
                         },
                         required: ['file_path']
                     }
                 },
                 {
                     name: 'move_or_rename_file',
-                    description: `
-                        **Purpose:** Moves a file or directory to a new location, or renames it.
-                        **When to use:**
-                        - Renaming a file to better reflect its purpose (e.g., 'utils.js' -> 'api_helpers.js').
-                        - Moving a file to a more appropriate directory during a code refactor.
-                        **Example 1 (Rename):**
-                        {
-                            "source_path": "src/old_name.js",
-                            "destination_path": "src/new_name.js"
-                        }
-                        **Example 2 (Move):**
-                        {
-                            "source_path": "src/component.js",
-                            "destination_path": "src/components/component.js"
-                        }
-                    `,
+                    description: `Move or rename file/directory.`,
                     inputSchema: {
                         type: 'object',
                         properties: {
-                            source_path: { type: 'string', description: 'The original path of the file or directory.' },
-                            destination_path: { type: 'string', description: 'The new path for the file or directory.' }
+                            source_path: { type: 'string' },
+                            destination_path: { type: 'string' }
                         },
                         required: ['source_path', 'destination_path']
                     }
                 },
                 {
-                    name: 'git_tool',
-                    description: `
-                        **Purpose:** Manages the project's version control with Git, enabling a professional, safe, and collaborative workflow.
-                        
-                        **THE PROFESSIONAL WORKFLOW (Follow these steps for every task):**
-                        
-                        **1. Synchronize:** Before starting any work, get the latest code from the remote repository.
-                           - **Command:** \`pull\`
-                           - **Why:** Prevents conflicts and ensures you are working on the most up-to-date version of the project.
-                           
-                        **2. Isolate Your Work:** Create a new branch for the feature or bugfix you are working on. NEVER commit directly to 'main' or 'master'.
-                           - **Command:** \`checkout\` with \`args: ["-b", "your-branch-name"]\`
-                           - **Why:** Isolates your changes, preventing unstable code from affecting the main codebase. Allows for code reviews and parallel development.
-                           
-                        **3. Develop & Test:** Make your code changes using the file editing tools, and then test them thoroughly using \`execute_shell_command\`.
-                        
-                        **4. Check Your Changes:** See which files you have modified.
-                           - **Command:** \`status\`
-                           - **Why:** Gives you a clear overview of your work before you commit it.
-                           
-                        **5. Stage & Commit:** Add your changes to the staging area and then commit them with a clear, descriptive message.
-                           - **Step 5a (Stage):** \`add\` with \`args: ["."]\` to add all changes, or \`args: ["path/to/file.js"]\` for specific files.
-                           - **Step 5b (Commit):** \`commit\` with \`args: ["feat: Implement user login functionality"]\`
-                           - **Why:** Staging allows you to group related changes into a single commit. A good commit message is crucial for project history.
-                           
-                        **6. Share Your Work:** Push your new branch and its commits to the remote repository.
-                           - **Command:** \`push\` with \`args: ["-u", "origin", "your-branch-name"]\`
-                           - **Why:** This makes your work available to others for review or integration and backs it up remotely.
-                        
-                        **Example Sequence for a New Feature:**
-                        1. \`{ "command": "pull" }\`
-                        2. \`{ "command": "checkout", "args": ["-b", "feature/add-login-button"] }\`
-                        3. ... (use file tools to edit code) ...
-                        4. \`{ "command": "execute_shell_command", "command": "npm test" }\`
-                        5. \`{ "command": "status" }\`
-                        6. \`{ "command": "add", "args": ["src/components/Login.js"] }\`
-                        7. \`{ "command": "commit", "args": ["feat: Add new login button component"] }\`
-                        8. \`{ "command": "push", "args": ["-u", "origin", "feature/add-login-button"] }\`
-                    `,
+                    name: 'git_status',
+                    description: `Get current Git status.`,
+                    inputSchema: { type: 'object', properties: {} }
+                },
+                {
+                    name: 'git_diff',
+                    description: `Show Git diff of changes.`,
                     inputSchema: {
                         type: 'object',
                         properties: {
-                            command: { type: 'string', enum: ['status', 'diff', 'add', 'commit', 'branch', 'pull', 'push', 'checkout', 'log', 'reset'], description: 'The Git command to execute.' },
-                            args: { type: 'array', items: { type: 'string' }, default: [], description: 'Arguments for the command (e.g., branch name, file paths, commit message).' }
+                            staged: { type: 'boolean', default: false }
+                        }
+                    }
+                },
+                {
+                    name: 'git_add',
+                    description: `Stage files for commit.`,
+                    inputSchema: {
+                        type: 'object',
+                        properties: {
+                            files: { type: 'array', items: { type: 'string' }, default: ['.'] }
+                        }
+                    }
+                },
+                {
+                    name: 'git_commit',
+                    description: `Commit staged changes.`,
+                    inputSchema: {
+                        type: 'object',
+                        properties: {
+                            message: { type: 'string' },
+                            all: { type: 'boolean', default: false, description: 'Auto-stage all changes' }
                         },
-                        required: ['command']
+                        required: ['message']
+                    }
+                },
+                {
+                    name: 'git_branch',
+                    description: `List or create branches.`,
+                    inputSchema: {
+                        type: 'object',
+                        properties: {
+                            create: { type: 'string', description: 'Create new branch' },
+                            delete: { type: 'string', description: 'Delete branch' },
+                            list: { type: 'boolean', default: true }
+                        }
+                    }
+                },
+                {
+                    name: 'git_checkout',
+                    description: `Switch branches or restore files.`,
+                    inputSchema: {
+                        type: 'object',
+                        properties: {
+                            branch: { type: 'string' },
+                            create: { type: 'boolean', default: false },
+                            file: { type: 'string', description: 'Restore specific file' }
+                        }
+                    }
+                },
+                {
+                    name: 'git_pull',
+                    description: `Pull changes from remote.`,
+                    inputSchema: {
+                        type: 'object',
+                        properties: {
+                            remote: { type: 'string', default: 'origin' },
+                            branch: { type: 'string' }
+                        }
+                    }
+                },
+                {
+                    name: 'git_push',
+                    description: `Push changes to remote.`,
+                    inputSchema: {
+                        type: 'object',
+                        properties: {
+                            remote: { type: 'string', default: 'origin' },
+                            branch: { type: 'string' },
+                            set_upstream: { type: 'boolean', default: false }
+                        }
+                    }
+                },
+                {
+                    name: 'git_merge',
+                    description: `Merge branch into current branch.`,
+                    inputSchema: {
+                        type: 'object',
+                        properties: {
+                            branch: { type: 'string' },
+                            no_ff: { type: 'boolean', default: false }
+                        },
+                        required: ['branch']
+                    }
+                },
+                {
+                    name: 'git_stash',
+                    description: `Stash or restore work in progress.`,
+                    inputSchema: {
+                        type: 'object',
+                        properties: {
+                            action: { type: 'string', enum: ['push', 'pop', 'list'], default: 'push' },
+                            message: { type: 'string' }
+                        }
+                    }
+                },
+                {
+                    name: 'git_log',
+                    description: `View commit history.`,
+                    inputSchema: {
+                        type: 'object',
+                        properties: {
+                            max_count: { type: 'integer', default: 10 },
+                            oneline: { type: 'boolean', default: false }
+                        }
                     }
                 },
                 {
                     name: 'create_github_repo',
-                    description: `
-    **Purpose:** Creates a new repository in a user's GitHub account.
-    
-    **When to use:**
-    - To programmatically create a new code repository.
-    - To initialize a project on GitHub from the command line.
-    
-    **Impact:** Automates the creation of GitHub repositories.
-    
-    **Example:** Create a new private repository named 'my-new-project'.
-    {
-      "repo_name": "my-new-project",
-      "description": "This is a new project.",
-      "is_private": true
-    }
-  `,
+                    description: `Create GitHub repository. Requires GITHUB_TOKEN in .env`,
                     inputSchema: {
                         type: 'object',
                         properties: {
-                            auth_token: {
-                                type: 'string',
-                                description: 'Optional GitHub Personal Access Token with repo scope. If not provided, the server will use the GITHUB_TOKEN from its environment variables.'
-                            },
-                            repo_name: {
-                                type: 'string',
-                                description: 'The name of the new repository'
-                            },
-                            description: {
-                                type: 'string',
-                                description: 'A short description of the repository'
-                            },
-                            is_private: {
-                                type: 'boolean',
-                                default: false,
-                                description: 'Whether the repository should be private'
-                            }
+                            repo_name: { type: 'string' },
+                            description: { type: 'string' },
+                            is_private: { type: 'boolean', default: false }
                         },
                         required: ['repo_name']
+                    }
+                },
+                {
+                    name: 'append_prepend_content',
+                    description: `Add content to file start/end.`,
+                    inputSchema: {
+                        type: 'object',
+                        properties: {
+                            file_path: { type: 'string' },
+                            content: { type: 'string' },
+                            position: { type: 'string', enum: ['prepend', 'append'] },
+                            create_if_missing: { type: 'boolean', default: false }
+                        },
+                        required: ['file_path', 'content', 'position']
+                    }
+                },
+                {
+                    name: 'search_across_files',
+                    description: `Search multiple files at once.`,
+                    inputSchema: {
+                        type: 'object',
+                        properties: {
+                            search_text: { type: 'string' },
+                            file_pattern: { type: 'string', default: '*' },
+                            case_sensitive: { type: 'boolean', default: true },
+                            use_regex: { type: 'boolean', default: false },
+                            max_files: { type: 'integer', default: 100 },
+                            max_matches_per_file: { type: 'integer', default: 10 },
+                            context_lines: { type: 'integer', default: 0 }
+                        },
+                        required: ['search_text']
+                    }
+                },
+                {
+                    name: 'get_file_info',
+                    description: `Get file metadata without reading content.`,
+                    inputSchema: {
+                        type: 'object',
+                        properties: {
+                            file_path: { type: 'string' },
+                            file_paths: { type: 'array', items: { type: 'string' } },
+                            include_line_count: { type: 'boolean', default: false }
+                        }
+                    }
+                },
+                {
+                    name: 'analyze_project',
+                    description: `Get comprehensive project overview in one call.
+**Returns:** Project type, dependencies, structure, entry points, tests`,
+                    inputSchema: {
+                        type: 'object',
+                        properties: {
+                            max_depth: { type: 'integer', default: 3 },
+                            include_dependencies: { type: 'boolean', default: true },
+                            include_git_info: { type: 'boolean', default: true }
+                        }
                     }
                 }
             ]
@@ -415,34 +438,54 @@ class CodeCraftMCPServer {
 
         this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
             const { name, arguments: args } = request.params;
-            console.error(`Tool called: ${name}`, args);
+
             try {
                 let result;
                 switch (name) {
-                    case 'create_or_overwrite_file': result = await this.createOrOverwrite_file(args); break;
+                    // File operations
+                    case 'create_or_overwrite_file': result = await this.createOrOverwriteFile(args); break;
                     case 'smart_replace': result = await this.smartReplace(args); break;
                     case 'search_in_file': result = await this.searchInFile(args); break;
                     case 'get_code_context': result = await this.getCodeContext(args); break;
                     case 'delete_lines': result = await this.deleteLines(args); break;
-                    case 'execute_shell_command': result = await this.executeShellCommand(args); break;
+                    case 'insert_lines': result = await this.insertLines(args); break;
                     case 'read_file_content': result = await this.readFileContent(args); break;
                     case 'list_directory': result = await this.listDirectory(args); break;
                     case 'delete_file': result = await this.deleteFile(args); break;
                     case 'move_or_rename_file': result = await this.moveOrRenameFile(args); break;
-                    case 'git_tool': result = await this.gitTool(args); break;
+                    case 'append_prepend_content': result = await this.appendPrependContent(args); break;
+                    case 'search_across_files': result = await this.searchAcrossFiles(args); break;
+                    case 'get_file_info': result = await this.getFileInfo(args); break;
+
+                    // Git operations
+                    case 'git_status': result = await this.gitStatus(args); break;
+                    case 'git_diff': result = await this.gitDiff(args); break;
+                    case 'git_add': result = await this.gitAdd(args); break;
+                    case 'git_commit': result = await this.gitCommit(args); break;
+                    case 'git_branch': result = await this.gitBranch(args); break;
+                    case 'git_checkout': result = await this.gitCheckout(args); break;
+                    case 'git_pull': result = await this.gitPull(args); break;
+                    case 'git_push': result = await this.gitPush(args); break;
+                    case 'git_merge': result = await this.gitMerge(args); break;
+                    case 'git_stash': result = await this.gitStash(args); break;
+                    case 'git_log': result = await this.gitLog(args); break;
+
+                    // Special operations
+                    case 'execute_shell_command': result = await this.executeShellCommand(args); break;
                     case 'create_github_repo': result = await this.createGithubRepo(args); break;
+                    case 'analyze_project': result = await this.analyzeProject(args); break;
+
                     default: throw new Error(`Unknown tool: ${name}`);
                 }
                 return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
             } catch (error) {
-                console.error(`Error executing tool '${name}':`, error);
                 return {
                     content: [{
-                        type: 'text', text: JSON.stringify({
+                        type: 'text',
+                        text: JSON.stringify({
                             error: true,
-                            tool_name: name,
                             message: error.message,
-                            hint: this.getErrorHint(name, error)
+                            tool: name
                         }, null, 2)
                     }]
                 };
@@ -450,63 +493,93 @@ class CodeCraftMCPServer {
         });
     }
 
-    getErrorHint(toolName, error) {
-        const hints = {
-            'smart_replace': 'Could not find the specified code. Try using search_in_file to find the exact text, or use less context in old_code.',
-            'delete_lines': 'Invalid line range. Ensure start_line <= end_line and both are within file bounds.',
-            'git_tool': 'Git command failed. Check your arguments. Common issues: trying to push without committing, or checking out a branch that does not exist.',
-            'move_or_rename_file': 'Operation failed. Ensure the source path exists and the destination path is valid.',
-            'delete_file': 'Could not delete file. Ensure the file path is correct and the file exists.'
-        };
-        return hints[toolName] || 'Check inputs and try again.';
+    // File Operations
+    async createOrOverwriteFile({ file_path, content }) {
+        const safePath = this._resolveSandboxPath(file_path);
+        await fs.mkdir(path.dirname(safePath), { recursive: true });
+        await fs.writeFile(safePath, content, 'utf-8');
+        return { success: true, file_path, bytes_written: Buffer.byteLength(content) };
     }
-
-    // --- Tool Implementations ---
 
     async smartReplace({ file_path, old_code, new_code, match_mode = 'smart' }) {
-        const safePath = this._resolveSandboxPath(file_path);
-        const content = await fs.readFile(safePath, 'utf8');
+        try {
+            const safePath = this._resolveSandboxPath(file_path);
+            const content = await fs.readFile(safePath, 'utf8');
 
-        let newContent;
-        let matchFound = false;
-
-        if (match_mode === 'exact') {
-            if (content.includes(old_code)) {
+            let newContent;
+            if (match_mode === 'exact') {
+                if (!content.includes(old_code)) {
+                    throw new Error('Exact match not found');
+                }
                 newContent = content.replace(old_code, new_code);
-                matchFound = true;
+            } else if (match_mode === 'smart' || match_mode === 'fuzzy') {
+                // FIXED: Completely rewrite smart matching to avoid Promise issues
+                newContent = this._performSmartMatch(content, old_code, new_code);
+                if (newContent === null) {
+                    throw new Error('No match found with smart matching');
+                }
+            } else {
+                throw new Error(`Invalid match_mode: ${match_mode}`);
             }
-        } else { // 'smart' or 'fuzzy' will use the smart matching logic
-            const result = this.smartMatch(content, old_code, new_code);
-            if (result) {
-                newContent = result;
-                matchFound = true;
+
+            // Ensure we have a valid string
+            if (typeof newContent !== 'string') {
+                throw new Error(`Internal error: newContent is ${typeof newContent}, expected string`);
             }
+
+            // Write the file with the new content
+            await fs.writeFile(safePath, newContent, 'utf-8');
+            return { success: true, file_path, match_mode };
+        } catch (error) {
+            throw new Error(`smart_replace failed: ${error.message}`);
         }
-
-        if (!matchFound) {
-            throw new Error(`Could not find the specified code to replace. The old_code was not found in the file.`);
-        }
-
-        await fs.writeFile(safePath, newContent, 'utf-8');
-
-        return {
-            success: true,
-            file_path,
-            message: 'Code replaced successfully using smart matching.',
-            match_mode
-        };
     }
 
-    smartMatch(content, oldCode, newCode) {
-        // Strategy 1: Direct replacement (handles multi-line exact matches)
+    _performSmartMatch(content, oldCode, newCode) {
+        // Direct match first
         if (content.includes(oldCode)) {
             return content.replace(oldCode, newCode);
         }
 
-        // Strategy 2: Trimmed multi-line match (ignores leading/trailing whitespace on the whole block)
+        // Fuzzy line-by-line match
         const lines = content.split('\n');
         const oldLines = oldCode.trim().split('\n').map(l => l.trim());
-        const newLines = newCode.split('\n');
+
+        for (let i = 0; i <= lines.length - oldLines.length; i++) {
+            let match = true;
+            for (let j = 0; j < oldLines.length; j++) {
+                if (lines[i + j]?.trim() !== oldLines[j]) {
+                    match = false;
+                    break;
+                }
+            }
+
+            if (match) {
+                // Preserve indentation from first line
+                const indent = lines[i].match(/^(\s*)/)?.[1] || '';
+                const newLines = newCode.split('\n').map((line, idx) => {
+                    if (idx === 0) return line; // First line keeps its original indentation
+                    return line.trim() ? indent + line.trim() : line;
+                });
+
+                // Replace matched lines with new lines
+                lines.splice(i, oldLines.length, ...newLines);
+                return lines.join('\n');
+            }
+        }
+
+        return null; // No match found
+    }
+
+    _smartMatch(content, oldCode, newCode) {
+        // Direct match
+        if (content.includes(oldCode)) {
+            return content.replace(oldCode, newCode);
+        }
+
+        // Fuzzy line-by-line match
+        const lines = content.split('\n');
+        const oldLines = oldCode.trim().split('\n').map(l => l.trim());
 
         for (let i = 0; i <= lines.length - oldLines.length; i++) {
             let match = true;
@@ -518,89 +591,80 @@ class CodeCraftMCPServer {
             }
 
             if (match) {
-                // Found a match, preserve indentation from the first matched line
                 const indent = lines[i].match(/^(\s*)/)[1];
-                const indentedNewLines = newLines.map(line => indent + line);
-                lines.splice(i, oldLines.length, ...indentedNewLines);
+                const newLines = newCode.split('\n').map(line =>
+                    line.trim() ? indent + line : line
+                );
+                lines.splice(i, oldLines.length, ...newLines);
                 return lines.join('\n');
             }
         }
 
-        return false; // No match found
+        return null;
     }
 
-    async createOrOverwrite_file({ file_path, content }) {
-        const safePath = this._resolveSandboxPath(file_path);
-        await fs.mkdir(path.dirname(safePath), { recursive: true });
-        await fs.writeFile(safePath, content, 'utf-8');
-        return { success: true, file_path, message: 'File created/overwritten successfully.' };
-    }
-
-    async deleteFile({ file_path }) {
-        const safePath = this._resolveSandboxPath(file_path);
-        await fs.unlink(safePath);
-        return { success: true, file_path, message: 'File deleted successfully.' };
-    }
-
-    async moveOrRenameFile({ source_path, destination_path }) {
-        const safeSourcePath = this._resolveSandboxPath(source_path);
-        const safeDestPath = this._resolveSandboxPath(destination_path);
-        await fs.mkdir(path.dirname(safeDestPath), { recursive: true });
-        await fs.rename(safeSourcePath, safeDestPath);
-        return { success: true, from: source_path, to: destination_path, message: 'File moved/renamed successfully.' };
-    }
-
-    async searchInFile({ file_path, search_text, case_sensitive = true }) {
+    async searchInFile({ file_path, search_text, case_sensitive = true, use_regex = false, context_lines = 0 }) {
         const safePath = this._resolveSandboxPath(file_path);
         const content = await fs.readFile(safePath, 'utf8');
         const lines = content.split('\n');
         const matches = [];
 
-        const flags = case_sensitive ? 'g' : 'gi';
-        const searchRegex = new RegExp(search_text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), flags);
+        let searchRegex;
+        if (use_regex) {
+            searchRegex = new RegExp(search_text, case_sensitive ? 'g' : 'gi');
+        } else {
+            const escaped = search_text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            searchRegex = new RegExp(escaped, case_sensitive ? 'g' : 'gi');
+        }
 
         lines.forEach((line, index) => {
+            searchRegex.lastIndex = 0;
+
             if (searchRegex.test(line)) {
-                matches.push({
+                const match = {
                     line_number: index + 1,
-                    content: line,
-                });
+                    content: line
+                };
+
+                // Fixed context_lines implementation
+                if (context_lines > 0) {
+                    const start = Math.max(0, index - context_lines);
+                    const end = Math.min(lines.length - 1, index + context_lines);
+
+                    match.context = [];
+                    for (let i = start; i <= end; i++) {
+                        match.context.push({
+                            line_number: i + 1,
+                            content: lines[i],
+                            is_match: i === index
+                        });
+                    }
+                }
+
+                matches.push(match);
             }
         });
 
-        return {
-            success: true,
-            file_path,
-            search_text,
-            matches,
-            total_matches: matches.length
-        };
+        return { success: true, file_path, search_text, matches, total_matches: matches.length };
     }
-
     async getCodeContext({ file_path, line_number, context_lines = 5 }) {
         const safePath = this._resolveSandboxPath(file_path);
         const content = await fs.readFile(safePath, 'utf8');
         const lines = content.split('\n');
 
         if (line_number < 1 || line_number > lines.length) {
-            throw new Error(`Line number ${line_number} is out of range (file has ${lines.length} lines)`);
+            throw new Error(`Line ${line_number} out of range (file has ${lines.length} lines)`);
         }
 
-        const startLine = Math.max(1, line_number - context_lines);
-        const endLine = Math.min(lines.length, line_number + context_lines);
+        const start = Math.max(1, line_number - context_lines);
+        const end = Math.min(lines.length, line_number + context_lines);
 
         const snippet = [];
-        for (let i = startLine - 1; i < endLine; i++) {
+        for (let i = start - 1; i < end; i++) {
             snippet.push(`${i + 1}: ${lines[i]}`);
         }
 
-        return {
-            success: true,
-            file_path,
-            center_line: line_number,
-            context: snippet.join('\n'),
-            total_lines: lines.length
-        };
+        return { success: true, file_path, center_line: line_number, context: snippet.join('\n') };
     }
 
     async deleteLines({ file_path, start_line, end_line }) {
@@ -609,45 +673,105 @@ class CodeCraftMCPServer {
         const lines = content.split('\n');
 
         if (start_line < 1 || end_line > lines.length || start_line > end_line) {
-            throw new Error(`Invalid line range: ${start_line}-${end_line} (file has ${lines.length} lines)`);
+            throw new Error(`Invalid range ${start_line}-${end_line} (file has ${lines.length} lines)`);
         }
 
-        const deletedCount = end_line - start_line + 1;
-        lines.splice(start_line - 1, deletedCount);
-
+        lines.splice(start_line - 1, end_line - start_line + 1);
         await fs.writeFile(safePath, lines.join('\n'), 'utf-8');
 
         return {
             success: true,
             file_path,
-            lines_deleted: deletedCount,
-            message: `Deleted lines ${start_line}-${end_line} (${deletedCount} lines).`
+            lines_deleted: end_line - start_line + 1,
+            new_total_lines: lines.length
         };
     }
 
-    async executeShellCommand({ command, timeout_seconds = 120 }) {
-        return new Promise((resolve) => {
-            exec(command, {
-                cwd: SANDBOX_DIR,
-                timeout: timeout_seconds * 1000,
-                maxBuffer: 10 * 1024 * 1024 // 10MB buffer
-            }, (error, stdout, stderr) => {
-                resolve({
-                    success: !error,
-                    exit_code: error ? error.code : 0,
-                    stdout: stdout || '',
-                    stderr: stderr || '',
-                    command,
-                    timed_out: error && error.killed && error.signal === 'SIGTERM'
-                });
-            });
-        });
+    async insertLines({ file_path, content, position, match_occurrence = 1, create_if_missing = false, preserve_indentation = true }) {
+        const safePath = this._resolveSandboxPath(file_path);
+
+        let fileContent = '';
+        try {
+            fileContent = await fs.readFile(safePath, 'utf8');
+        } catch (error) {
+            if (create_if_missing && error.code === 'ENOENT') {
+                await fs.mkdir(path.dirname(safePath), { recursive: true });
+                fileContent = '';
+            } else {
+                throw error;
+            }
+        }
+
+        const lines = fileContent.split('\n');
+        let insertIndex = -1;
+        let matchedLine = '';
+
+        // Determine insertion position
+        if (position.line_number !== undefined) {
+            insertIndex = position.insert_mode === 'before' ?
+                position.line_number - 1 : position.line_number;
+        } else if (position.after_pattern || position.before_pattern) {
+            const pattern = position.after_pattern || position.before_pattern;
+            const isAfter = !!position.after_pattern;
+            let occurrenceCount = 0;
+
+            for (let i = 0; i < lines.length; i++) {
+                if (lines[i].includes(pattern)) {
+                    occurrenceCount++;
+                    if (occurrenceCount === match_occurrence) {
+                        insertIndex = isAfter ? i + 1 : i;
+                        matchedLine = lines[i];
+                        break;
+                    }
+                }
+            }
+
+            if (insertIndex === -1) {
+                throw new Error(`Pattern "${pattern}" not found`);
+            }
+        } else if (position.relative_to) {
+            const { pattern, offset } = position.relative_to;
+            let found = false;
+
+            for (let i = 0; i < lines.length; i++) {
+                if (lines[i].includes(pattern)) {
+                    insertIndex = i + offset + (offset >= 0 ? 1 : 0);
+                    matchedLine = lines[i];
+                    found = true;
+                    break;
+                }
+            }
+
+            if (!found) {
+                throw new Error(`Pattern "${pattern}" not found`);
+            }
+        }
+
+        // Apply indentation
+        let processedContent = content;
+        if (preserve_indentation && matchedLine) {
+            const indent = matchedLine.match(/^(\s*)/)[1];
+            processedContent = content.split('\n')
+                .map((line, i) => i === 0 || !line.trim() ? line : indent + line)
+                .join('\n');
+        }
+
+        lines.splice(insertIndex, 0, ...processedContent.split('\n'));
+        await fs.writeFile(safePath, lines.join('\n'), 'utf-8');
+
+        return {
+            success: true,
+            file_path,
+            inserted_at_line: insertIndex + 1,
+            lines_inserted: processedContent.split('\n').length
+        };
     }
 
     async readFileContent({ file_path }) {
         const safePath = this._resolveSandboxPath(file_path);
         const content = await fs.readFile(safePath, 'utf8');
         const stats = await fs.stat(safePath);
+
         return {
             success: true,
             file_path,
@@ -657,133 +781,454 @@ class CodeCraftMCPServer {
         };
     }
 
-    async listDirectory({ dir_path = '.' }) {
+    async listDirectory({ dir_path = '.', filter, include_hidden = false, max_depth = 1, max_files = 100 }) {
         const safePath = this._resolveSandboxPath(dir_path);
-        const entries = await fs.readdir(safePath, { withFileTypes: true });
+        const results = [];
 
-        const items = await Promise.all(entries.map(async (entry) => {
-            const fullPath = path.join(safePath, entry.name);
-            let stats;
-            try {
-                stats = await fs.stat(fullPath);
-            } catch (e) {
-                // Handle broken symlinks or permission errors gracefully
-                return { name: entry.name, type: 'inaccessible', size: null, modified: null };
+        async function scanDir(currentPath, currentDepth) {
+            if (currentDepth > max_depth || results.length >= max_files) return;
+
+            const entries = await fs.readdir(currentPath, { withFileTypes: true });
+
+            for (const entry of entries) {
+                if (results.length >= max_files) break;
+                if (!include_hidden && entry.name.startsWith('.')) continue;
+
+                const fullPath = path.join(currentPath, entry.name);
+                const relativePath = path.relative(safePath, fullPath);
+
+                if (filter) {
+                    const pattern = new RegExp(filter.replace(/\*/g, '.*'));
+                    if (!pattern.test(entry.name)) continue;
+                }
+
+                const stats = await fs.stat(fullPath);
+                results.push({
+                    name: entry.name,
+                    path: relativePath || '.',
+                    type: entry.isDirectory() ? 'directory' : 'file',
+                    size: stats.size,
+                    modified: stats.mtime
+                });
+
+                if (entry.isDirectory() && currentDepth < max_depth) {
+                    await scanDir(fullPath, currentDepth + 1);
+                }
             }
-            return {
-                name: entry.name,
-                type: entry.isDirectory() ? 'directory' : 'file',
-                size: entry.isFile() ? stats.size : null,
-                modified: stats.mtime
-            };
-        }));
+        }
+
+        await scanDir(safePath, 1);
+        return { success: true, path: dir_path, entries: results, total: results.length };
+    }
+
+    async deleteFile({ file_path }) {
+        const safePath = this._resolveSandboxPath(file_path);
+        await fs.unlink(safePath);
+        return { success: true, file_path };
+    }
+
+    async moveOrRenameFile({ source_path, destination_path }) {
+        const safeSrc = this._resolveSandboxPath(source_path);
+        const safeDst = this._resolveSandboxPath(destination_path);
+        await fs.mkdir(path.dirname(safeDst), { recursive: true });
+        await fs.rename(safeSrc, safeDst);
+        return { success: true, from: source_path, to: destination_path };
+    }
+
+    async appendPrependContent({ file_path, content, position, create_if_missing = false }) {
+        const safePath = this._resolveSandboxPath(file_path);
+
+        let existing = '';
+        try {
+            existing = await fs.readFile(safePath, 'utf8');
+        } catch (error) {
+            if (!create_if_missing || error.code !== 'ENOENT') throw error;
+        }
+
+        const newContent = position === 'prepend' ? content + existing : existing + content;
+        await fs.writeFile(safePath, newContent, 'utf-8');
+
+        return { success: true, file_path, position, bytes_added: Buffer.byteLength(content) };
+    }
+
+    async searchAcrossFiles({ search_text, file_pattern = '*', case_sensitive = true, use_regex = false, max_files = 100, max_matches_per_file = 10, context_lines = 0 }) {
+        const files = await glob(file_pattern, {
+            cwd: SANDBOX_DIR,
+            nodir: true,
+            ignore: ['node_modules/**', '.git/**', '**/*.min.js']
+        });
+
+        const results = [];
+        const filesToSearch = files.slice(0, max_files);
+
+        let searchRegex;
+        if (use_regex) {
+            searchRegex = new RegExp(search_text, case_sensitive ? 'g' : 'gi');
+        } else {
+            const escaped = search_text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            searchRegex = new RegExp(escaped, case_sensitive ? 'g' : 'gi');
+        }
+
+        for (const file of filesToSearch) {
+            const filePath = path.join(SANDBOX_DIR, file);
+            try {
+                const content = await fs.readFile(filePath, 'utf8');
+                const lines = content.split('\n');
+                const fileMatches = [];
+
+                for (let i = 0; i < lines.length && fileMatches.length < max_matches_per_file; i++) {
+                    if (searchRegex.test(lines[i])) {
+                        const match = {
+                            line_number: i + 1,
+                            content: lines[i]
+                        };
+
+                        if (context_lines > 0) {
+                            const start = Math.max(0, i - context_lines);
+                            const end = Math.min(lines.length - 1, i + context_lines);
+                            match.context = lines.slice(start, end + 1).map((l, idx) => ({
+                                line_number: start + idx + 1,
+                                content: l,
+                                is_match: start + idx === i
+                            }));
+                        }
+
+                        fileMatches.push(match);
+                    }
+                    searchRegex.lastIndex = 0;
+                }
+
+                if (fileMatches.length > 0) {
+                    results.push({
+                        file_path: file,
+                        matches: fileMatches,
+                        match_count: fileMatches.length
+                    });
+                }
+            } catch (error) {
+                // Skip binary/unreadable files
+            }
+        }
 
         return {
             success: true,
-            path: dir_path,
-            entries: items.sort((a, b) => {
-                if (a.type !== b.type) return a.type === 'directory' ? -1 : 1;
-                return a.name.localeCompare(b.name);
-            })
+            search_text,
+            files_searched: filesToSearch.length,
+            files_with_matches: results.length,
+            results
         };
     }
 
-    async gitTool({ command, args = [] }) {
-        switch (command) {
-            case 'status':
-                return { ...(await this.git.status()), success: true };
-            case 'diff':
-                return { success: true, diff: await this.git.diff(args) };
-            case 'add':
-                await this.git.add(args.length > 0 ? args : '.');
-                return { success: true, message: `Added files: ${args.join(', ') || 'all staged'}` };
-            case 'commit':
-                if (args.length === 0) throw new Error("Commit message is required.");
-                return { success: true, ...(await this.git.commit(args[0])) };
-            case 'branch':
-                return { success: true, ...(await this.git.branch(args)) };
-            case 'pull':
-                return { success: true, ...(await this.git.pull(args)) };
+    async getFileInfo({ file_path, file_paths, include_line_count = false }) {
+        const paths = file_paths || [file_path];
+        const results = [];
+
+        for (const fp of paths) {
+            try {
+                const safePath = this._resolveSandboxPath(fp);
+                const stats = await fs.stat(safePath);
+                const info = {
+                    file_path: fp,
+                    exists: true,
+                    type: stats.isDirectory() ? 'directory' : 'file',
+                    size_bytes: stats.size,
+                    modified: stats.mtime,
+                    created: stats.birthtime
+                };
+
+                if (include_line_count && stats.isFile()) {
+                    try {
+                        const content = await fs.readFile(safePath, 'utf8');
+                        info.line_count = content.split('\n').length;
+                    } catch {
+                        info.line_count = null;
+                    }
+                }
+
+                results.push(info);
+            } catch (error) {
+                results.push({
+                    file_path: fp,
+                    exists: false,
+                    error: error.message
+                });
+            }
+        }
+
+        return {
+            success: true,
+            results: file_paths ? results : results[0]
+        };
+    }
+
+    // Shell command execution
+    async executeShellCommand({ command, working_dir = '.', timeout_seconds = 120 }) {
+        this._validateShellCommand(command);
+        const cwd = this._resolveSandboxPath(working_dir);
+
+        return new Promise((resolve) => {
+            exec(command, {
+                cwd,
+                timeout: timeout_seconds * 1000,
+                maxBuffer: 10 * 1024 * 1024
+            }, (error, stdout, stderr) => {
+                resolve({
+                    success: !error,
+                    exit_code: error?.code || 0,
+                    stdout: stdout || '',
+                    stderr: stderr || '',
+                    command,
+                    working_dir,
+                    timed_out: error?.killed && error?.signal === 'SIGTERM'
+                });
+            });
+        });
+    }
+
+    // Git operations
+    async gitStatus() {
+        const status = await this.git.status();
+        return { success: true, ...status };
+    }
+
+    async gitDiff({ staged = false }) {
+        const diff = staged ?
+            await this.git.diff(['--cached']) :
+            await this.git.diff();
+        return { success: true, diff };
+    }
+
+    async gitAdd({ files = ['.'] }) {
+        await this.git.add(files);
+        return { success: true, staged: files };
+    }
+
+    async gitCommit({ message, all = false }) {
+        const args = all ? ['-a', '-m', message] : ['-m', message];
+        const result = await this.git.commit(message, all ? { '-a': null } : undefined);
+        return { success: true, ...result };
+    }
+
+    async gitBranch({ create, delete: del, list = true }) {
+        if (create) {
+            await this.git.checkoutLocalBranch(create);
+            return { success: true, created: create };
+        }
+        if (del) {
+            await this.git.deleteLocalBranch(del);
+            return { success: true, deleted: del };
+        }
+        const branches = await this.git.branch();
+        return { success: true, ...branches };
+    }
+
+    async gitCheckout({ branch, create = false, file }) {
+        if (file) {
+            await this.git.checkout(['--', file]);
+            return { success: true, restored: file };
+        }
+        if (create) {
+            await this.git.checkoutLocalBranch(branch);
+        } else {
+            await this.git.checkout(branch);
+        }
+        return { success: true, branch };
+    }
+
+    async gitPull({ remote = 'origin', branch }) {
+        const args = branch ? [remote, branch] : [remote];
+        const result = await this.git.pull(...args);
+        return { success: true, ...result };
+    }
+
+    async gitPush({ remote = 'origin', branch, set_upstream = false }) {
+        const args = [remote];
+        if (branch) args.push(branch);
+        if (set_upstream) args.unshift('-u');
+
+        const result = await this.git.push(args);
+        return { success: true, pushed: true, remote, branch };
+    }
+
+    async gitMerge({ branch, no_ff = false }) {
+        const options = no_ff ? { '--no-ff': null } : {};
+        const result = await this.git.merge([branch], options);
+        return { success: true, ...result };
+    }
+
+    async gitStash({ action = 'push', message }) {
+        switch (action) {
             case 'push':
-                return { success: true, ...(await this.git.push(args)) };
-            case 'checkout':
-                return { success: true, message: await this.git.checkout(args) };
-            case 'log':
-                return { success: true, ...(await this.git.log(args)) };
-            case 'reset':
-                return { success: true, message: await this.git.reset(args) };
+                const stashArgs = message ? ['push', '-m', message] : ['push'];
+                await this.git.stash(stashArgs);
+                return { success: true, action: 'pushed' };
+            case 'pop':
+                await this.git.stash(['pop']);
+                return { success: true, action: 'popped' };
+            case 'list':
+                const list = await this.git.stashList();
+                return { success: true, stashes: list.all };
             default:
-                throw new Error(`Unsupported git command: ${command}`);
+                throw new Error(`Unknown stash action: ${action}`);
         }
     }
 
-    async createGithubRepo(args) {
-        const { repo_name, description, is_private = false, auth_token } = args;
+    async gitLog({ max_count = 10, oneline = false }) {
+        const options = {
+            maxCount: max_count,
+            format: oneline ? { oneline: true } : undefined
+        };
+        const log = await this.git.log(options);
+        return { success: true, commits: log.all };
+    }
 
-        // Use the token from the tool call first, otherwise use the top-level variable
-        const token = auth_token || GITHUB_TOKEN_FALLBACK;
-
-        if (!token) {
-            throw new Error('GitHub token is missing. Provide it in the tool call or configure it on the server.');
+    // GitHub operations
+    async createGithubRepo({ repo_name, description, is_private = false }) {
+        if (!GITHUB_TOKEN) {
+            throw new Error('GITHUB_TOKEN not configured in .env file');
         }
 
-        try {
-            // Initialize Octokit with the token
-            const octokit = new Octokit({ auth: token });
+        const octokit = new Octokit({ auth: GITHUB_TOKEN });
+        const response = await octokit.repos.createForAuthenticatedUser({
+            name: repo_name,
+            description,
+            private: is_private
+        });
 
-            // Call the GitHub API to create the repository
-            const response = await octokit.repos.createForAuthenticatedUser({
-                name: repo_name,
-                description: description,
-                private: is_private,
-            });
+        return {
+            success: true,
+            repo_name,
+            url: response.data.html_url,
+            ssh_url: response.data.ssh_url,
+            clone_url: response.data.clone_url
+        };
+    }
 
-            // Return a success message with the new repo's URL
-            const repoUrl = response.data.html_url;
-            return {
-                content: [
-                    {
-                        type: 'text',
-                        text: `✅ Successfully created GitHub repository!
+    // Project analysis
+    async analyzeProject({ max_depth = 3, include_dependencies = true, include_git_info = true }) {
+        const analysis = {
+            project_type: 'unknown',
+            root_path: SANDBOX_DIR,
+            structure: {},
+            entry_points: [],
+            test_files: [],
+            config_files: [],
+            dependencies: null,
+            git_info: null
+        };
 
-                        Repository Name: ${repo_name}
-                        URL: ${repoUrl}
-                        Visibility: ${is_private ? 'Private' : 'Public'}`
+        // Detect project type and dependencies
+        const files = await fs.readdir(SANDBOX_DIR);
+
+        if (files.includes('package.json')) {
+            analysis.project_type = 'node.js';
+            if (include_dependencies) {
+                try {
+                    const pkg = JSON.parse(await fs.readFile(path.join(SANDBOX_DIR, 'package.json'), 'utf8'));
+                    analysis.dependencies = {
+                        prod: Object.keys(pkg.dependencies || {}),
+                        dev: Object.keys(pkg.devDependencies || {})
+                    };
+                    analysis.entry_points.push(pkg.main || 'index.js');
+                    if (pkg.scripts?.test) analysis.test_command = pkg.scripts.test;
+                } catch { }
+            }
+        } else if (files.includes('requirements.txt') || files.includes('setup.py')) {
+            analysis.project_type = 'python';
+            if (include_dependencies && files.includes('requirements.txt')) {
+                try {
+                    const reqs = await fs.readFile(path.join(SANDBOX_DIR, 'requirements.txt'), 'utf8');
+                    analysis.dependencies = reqs.split('\n').filter(l => l && !l.startsWith('#'));
+                } catch { }
+            }
+        } else if (files.includes('pom.xml')) {
+            analysis.project_type = 'java-maven';
+        } else if (files.includes('build.gradle')) {
+            analysis.project_type = 'java-gradle';
+        } else if (files.includes('Cargo.toml')) {
+            analysis.project_type = 'rust';
+        } else if (files.includes('go.mod')) {
+            analysis.project_type = 'go';
+        }
+
+        // Get directory structure
+        const getStructure = async (dir, depth) => {
+            if (depth > max_depth) return null;
+
+            const entries = await fs.readdir(dir, { withFileTypes: true });
+            const structure = {};
+
+            for (const entry of entries) {
+                if (entry.name.startsWith('.') || entry.name === 'node_modules') continue;
+
+                const fullPath = path.join(dir, entry.name);
+                if (entry.isDirectory()) {
+                    structure[entry.name + '/'] = await getStructure(fullPath, depth + 1);
+                } else {
+                    structure[entry.name] = 'file';
+
+                    // Identify special files
+                    if (entry.name.match(/\.(test|spec)\.(js|ts|py|java)$/)) {
+                        analysis.test_files.push(path.relative(SANDBOX_DIR, fullPath));
                     }
-                ]
-            };
-        } catch (error) {
-            // Handle potential errors like bad credentials or repo already exists
-            throw new Error(`GitHub repository creation failed: ${error.message}`);
+                    if (entry.name.match(/^(config|settings|.*rc)\.(json|js|yaml|yml)$/)) {
+                        analysis.config_files.push(path.relative(SANDBOX_DIR, fullPath));
+                    }
+                    if (!analysis.entry_points.length && entry.name.match(/^(index|main|app)\.(js|ts|py|java)$/)) {
+                        analysis.entry_points.push(path.relative(SANDBOX_DIR, fullPath));
+                    }
+                }
+            }
+
+            return structure;
+        };
+
+        analysis.structure = await getStructure(SANDBOX_DIR, 1);
+
+        // Get git info
+        if (include_git_info) {
+            try {
+                const status = await this.git.status();
+                const branch = await this.git.branch();
+                analysis.git_info = {
+                    current_branch: branch.current,
+                    branches: branch.all,
+                    modified_files: status.modified.length,
+                    untracked_files: status.not_added.length,
+                    ahead: status.ahead,
+                    behind: status.behind
+                };
+            } catch {
+                analysis.git_info = { initialized: false };
+            }
         }
+
+        return analysis;
     }
 
     async start() {
-        console.error(`🚀 CodeCraft MCP Server v2.1 is online.`);
-        console.error(`🔒 Operating in sandboxed directory: ${SANDBOX_DIR}`);
-        console.error(`✨ Enhanced with professional Git workflow and file management tools.`);
+        console.error(`🚀 CodeCraft MCP Server v2.0`);
+        console.error(`📁 Working directory: ${SANDBOX_DIR}`);
+        console.error(`🔒 Shell mode: ${SHELL_MODE}`);
+        console.error(`🔑 GitHub token: ${GITHUB_TOKEN ? 'configured' : 'not configured'}`);
+
         const transport = new StdioServerTransport();
         await this.server.connect(transport);
     }
 }
 
-// --- Main Execution ---
-try {
-    if (!SANDBOX_DIR) {
-        throw new Error("CRITICAL: 'projectDirectory' is not defined in package.json.");
-    }
-    await fs.mkdir(SANDBOX_DIR, { recursive: true });
-    const server = new CodeCraftMCPServer();
-    server.start().catch((error) => {
-        console.error(`\n❌ Critical server error:\n${error.message}\n`);
+// Start server
+(async () => {
+    try {
+        const server = new CodeCraftMCPServer();
+        await server.start();
+    } catch (error) {
+        console.error('Failed to start server:', error);
         process.exit(1);
-    });
-} catch (error) {
-    console.error(`\n❌ Failed to initialize server:\n${error.message}\n`);
-    process.exit(1);
-}
+    }
+})();
 
 process.on('SIGINT', () => {
-    console.error('\nShutting down gracefully...');
+    console.error('\n👋 Shutting down gracefully...');
     process.exit(0);
 });

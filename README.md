@@ -75,18 +75,20 @@ Before setting up CodeCraft MCP, ensure you have:
    Open the `claude_desktop_config.json` file and add CodeCraft MCP to the `mcpServers` section:
 
    ```json
-   {
-     "mcpServers": {
-       "codecraft-mcp": {
-         "command": "node",
-         "args": [
-           "C:\\\\path\\\\to\\\\codecraft-mcp\\\\server.js"
-         ],
-         "env": {}
-       }
-     }
-   }
+    "codecraft-mcp": {
+      "command": "C:\\Program Files\\nodejs\\node.exe",
+      "args": [
+         "C:\\\\path\\\\to\\\\codecraft-mcp\\\\server.js"
+      ],
+      "env": {
+        "GITHUB_TOKEN": "your_github_token",
+        "PROJECT_DIR": "your_project_dict",
+        "SHELL_MODE": "unsafe"
+      }
+    }
    ```
+# Security mode or SHELL MODE - set to "unsafe" to allow unrestricted shell commands, use restricted for safer operations
+# WARNING: Only enable in trusted environments
 
    **Important Notes**:
    - Replace `C:\\\\path\\\\to\\\\codecraft-mcp\\\\server.js` with the actual path to your server.js file
